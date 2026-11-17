@@ -3,83 +3,81 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>野生动物追踪串号校正与计数台</title>
+  <title>相机陷阱连拍重复帧核查台</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header>
-  <h1>野生动物追踪串号校正与计数台</h1>
-  <p class="subtitle">上传帧图与检测框 → 标记同只/异只 → 调整代价参数 → 求全局最优关联与动物计数</p>
+  <h1>相机陷阱连拍重复帧核查台</h1>
+  <p class="subtitle">上传一次连拍（≤6 帧、≤512×512）与检测框 → 分别比对背景与动物区域 → 给出保留 / 省略 / 待核建议（原图与检测框只读，不做修改）</p>
 </header>
 
 <div id="layout">
   <aside id="sidebar">
     <section class="card">
       <h2>1. 数据</h2>
-      <label class="file-label">帧图片（≤10，可多选）
+      <label class="file-label">连拍帧图片（1~6 张，尺寸相同）
         <input type="file" id="img-input" accept="image/*" multiple>
       </label>
-      <label class="file-label">检测 JSON（≤30 框）
+      <label class="file-label">检测 JSON（每框含 frame 与 rect）
         <input type="file" id="json-input" accept=".json,application/json">
       </label>
       <div class="btn-row">
         <button id="upload-btn">上传并创建会话</button>
-        <button id="example-btn" class="secondary">加载交叉遮挡示例</button>
+        <button id="example-btn" class="secondary">加载连拍示例</button>
       </div>
-      <div id="session-info" class="muted">尚未创建会话。</div>
+      <div id="session-info" class="muted">尚未创建会话。切换会话会立即撤下旧建议。</div>
     </section>
 
     <section class="card">
-      <h2>3. 代价参数</h2>
-      <label class="param">距离权重 w<sub>dist</sub>（中心距离平方）
-        <input type="number" id="p-wdist" min="0" step="any" value="1">
-      </label>
-      <label class="param">外观权重 w<sub>app</sub>（1 − 余弦相似度）
-        <input type="number" id="p-wapp" min="0" step="any" value="10000">
-      </label>
-      <label class="param">每条新轨迹罚分
-        <input type="number" id="p-penalty" min="0" step="any" value="15000">
-      </label>
-      <div class="muted small">修改任一参数会立即撤下旧结果。</div>
+      <h2>2. 重复帧分析</h2>
+      <button id="analyze-btn" class="primary" disabled>开始重复帧分析</button>
+      <div id="analyze-status" class="muted small">
+        分析在后台运行；切换会话或重新分析会撤下当前建议，迟到结果按版本号自动作废。
+      </div>
+      <div class="muted small rule-list">
+        <b>判定规则</b>
+        <ul>
+          <li>背景、动物两类区域分开比对，容忍轻微 JPEG 重编码；</li>
+          <li>动物位置或姿态有可辨变化 → 保留该帧；</li>
+          <li>两类区域证据都充分且组内两两相符 → 保留最早帧、省略其余；</li>
+          <li>证据不足或重复关系矛盾 → 待核，不自动省略。</li>
+        </ul>
+      </div>
     </section>
 
     <section class="card">
-      <h2>4. 全局最优求解</h2>
-      <button id="solve-btn" class="primary" disabled>计算最优关联</button>
-      <div id="solve-status" class="muted small">计算期间可继续修改判断与参数；若输入已变化，迟到的结果将自动作废，不会覆盖新输入。</div>
+      <h2>图例</h2>
+      <div class="legend"><span class="dot keep"></span>保留（keep）</div>
+      <div class="legend"><span class="dot omit"></span>建议省略（omit）</div>
+      <div class="legend"><span class="dot review"></span>待核（review，不自动省略）</div>
     </section>
   </aside>
 
   <main>
     <section class="card" id="viewer-card">
-      <h2>2. 按帧查看与标记</h2>
+      <h2>3. 逐帧核查</h2>
       <div id="frame-nav">
         <button id="prev-frame">◀ 上一帧</button>
         <span id="frame-indicator">— / —</span>
         <button id="next-frame">下一帧 ▶</button>
-        <span class="muted small">（← / → 键切换；点击两个框后可标记）</span>
+        <span class="muted small">（← / → 键切换）</span>
       </div>
       <div id="canvas-wrap">
-        <canvas id="canvas" width="640" height="360"></canvas>
+        <canvas id="canvas" width="512" height="384"></canvas>
         <div id="no-session" class="muted">请先上传数据或加载示例。</div>
       </div>
-      <div id="selection-info" class="muted">未选择框。</div>
-      <div class="btn-row">
-        <button id="mark-same" disabled>标记为同只</button>
-        <button id="mark-diff" disabled>标记为异只</button>
-        <button id="mark-clear" disabled>清除该对判断</button>
-      </div>
-      <div id="judgment-panel">
-        <h3>当前身份判断 <span id="judgment-count" class="muted"></span></h3>
-        <ul id="judgment-list"></ul>
-      </div>
+      <div id="frame-verdict" class="muted">当前帧尚无建议。</div>
     </section>
 
     <section class="card" id="result-card">
-      <h2>结果</h2>
-      <div id="result-banner" class="banner muted">尚无结果。</div>
-      <div id="result-summary"></div>
-      <div id="trajectory-list"></div>
+      <h2>分析建议</h2>
+      <div id="result-banner" class="banner muted">尚无分析结果。</div>
+      <div id="verdict-summary"></div>
+      <h3>逐帧决定</h3>
+      <div id="verdict-list"></div>
+      <h3>帧间配对明细（背景 / 动物分区指标）</h3>
+      <div id="pair-list"></div>
     </section>
   </main>
 </div>

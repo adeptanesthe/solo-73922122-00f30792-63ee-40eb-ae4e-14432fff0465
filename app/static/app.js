@@ -1,23 +1,25 @@
-/* 野生动物追踪串号校正与计数台 —— 前端逻辑 */
+/* 相机陷阱连拍重复帧核查台 —— 前端逻辑 */
 "use strict";
 
-const PALETTE = [
-  "#ff4d4f", "#36cfc9", "#ffa940", "#73d13d", "#9254de",
-  "#40a9ff", "#f759ab", "#a0d911", "#ffc53d", "#597ef7",
-  "#ff7a45", "#5cdbd3", "#b37feb", "#95de64", "#69c0ff",
-];
+const DECISION_META = {
+  keep:   { label: "保留", cls: "keep" },
+  omit:   { label: "建议省略", cls: "omit" },
+  review: { label: "待核", cls: "review" },
+};
+const LABEL_META = {
+  duplicate: { text: "重复", cls: "dup" },
+  different: { text: "内容变化", cls: "diff" },
+  unknown:   { text: "证据不足/灰区", cls: "unk" },
+};
 
 const state = {
   sessionId: null,
   version: 0,
   nFrames: 0,
   detections: [],
-  judgments: [],          // [{a, b, type}]，a/b 为框号
-  params: { w_dist: 1, w_app: 10000, penalty: 15000 },
-  images: [],             // HTMLImageElement
+  images: [],
   currentFrame: 0,
-  selection: [],          // 已选框号（至多 2 个）
-  result: null,           // 当前展示的求解结果
+  report: null,
   jobId: null,
   pollTimer: null,
 };
@@ -25,17 +27,6 @@ const state = {
 const $ = (id) => document.getElementById(id);
 const canvas = $("canvas");
 const ctx = canvas.getContext("2d");
-
-const detById = (id) => state.detections.find((d) => d.id === id);
-const pairKey = (a, b) => [a, b].sort().join("||");
-
-function trajIndexOf(boxId) {
-  if (!state.result || !state.result.feasible) return null;
-  for (let i = 0; i < state.result.trajectories.length; i++) {
-    if (state.result.trajectories[i].boxes.some((b) => b.id === boxId)) return i;
-  }
-  return null;
-}
 
 /* ---------------------------------------------------------------- API */
 
@@ -61,18 +52,28 @@ function showError(targetId, err) {
 
 /* ------------------------------------------------------------ 会话载入 */
 
+function resetSuggestion(bannerText) {
+  state.report = null;
+  state.jobId = null;
+  if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+  const banner = $("result-banner");
+  banner.className = "banner stale";
+  banner.textContent = bannerText;
+  $("verdict-summary").innerHTML = "";
+  $("verdict-list").innerHTML = "";
+  $("pair-list").innerHTML = "";
+  $("frame-verdict").className = "muted";
+  $("frame-verdict").textContent = "当前帧尚无建议。";
+}
+
 function loadSession(payload) {
+  // 切换会话：立即撤下旧建议，旧任务的迟到结果之后会被会话/版本校验拦截
+  resetSuggestion("已切换会话，旧建议已撤下。");
   state.sessionId = payload.session_id;
   state.version = payload.version;
   state.nFrames = payload.n_frames;
   state.detections = payload.detections;
-  state.judgments = payload.judgments;
-  state.params = payload.params;
   state.currentFrame = 0;
-  state.selection = [];
-  state.result = null;
-  state.jobId = null;
-  if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
 
   state.images = [];
   for (let i = 0; i < state.nFrames; i++) {
@@ -82,28 +83,25 @@ function loadSession(payload) {
     state.images.push(img);
   }
 
-  $("p-wdist").value = payload.params.w_dist;
-  $("p-wapp").value = payload.params.w_app;
-  $("p-penalty").value = payload.params.penalty;
-
   const info = $("session-info");
   info.classList.add("muted");
   info.style.color = "";
   info.innerHTML =
-    `会话 <b>${payload.session_id}</b>：${payload.n_frames} 帧、` +
-    `${payload.detections.length} 个检测框。` +
+    `会话 <b>${payload.session_id}</b>（输入版本 v${payload.version}）：` +
+    `${payload.n_frames} 帧、${payload.detections.length} 个检测框。` +
     (payload.description ? `<br>${payload.description}` : "");
 
-  $("solve-btn").disabled = false;
+  $("analyze-btn").disabled = false;
   $("no-session").style.display = "none";
-  renderAll();
+  renderFrameNav();
+  draw();
 }
 
 async function uploadSession() {
   const imgs = $("img-input").files;
   const jsons = $("json-input").files;
-  if (imgs.length === 0 || imgs.length > 10) {
-    alert("请选择 1~10 张帧图片。");
+  if (imgs.length === 0 || imgs.length > 6) {
+    alert("请选择 1~6 张帧图片。");
     return;
   }
   if (jsons.length !== 1) {
@@ -123,8 +121,7 @@ async function uploadSession() {
 
 async function loadExample() {
   try {
-    const payload = await api("/api/example", { method: "POST" });
-    loadSession(payload);
+    loadSession(await api("/api/example", { method: "POST" }));
   } catch (err) {
     showError("session-info", err);
   }
@@ -136,6 +133,11 @@ function detsInFrame(f) {
   return state.detections.filter((d) => d.frame === f);
 }
 
+function verdictOf(f) {
+  if (!state.report) return null;
+  return state.report.verdicts.find((v) => v.frame === f) || null;
+}
+
 function draw() {
   const img = state.images[state.currentFrame];
   if (!img || !img.complete || img.naturalWidth === 0) return;
@@ -145,23 +147,19 @@ function draw() {
 
   for (const d of detsInFrame(state.currentFrame)) {
     const [x, y, w, h] = d.rect;
-    const ti = trajIndexOf(d.id);
-    const color = ti !== null ? PALETTE[ti % PALETTE.length] : "#ffe600";
-    const selected = state.selection.includes(d.id);
-
-    ctx.lineWidth = selected ? 4 : 2;
-    ctx.strokeStyle = selected ? "#ffffff" : color;
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#ffe600";
     ctx.strokeRect(x, y, w, h);
-
-    const label = `#${d.id}` + (ti !== null ? ` T${ti + 1}` : "");
     ctx.font = "bold 12px sans-serif";
+    const label = `#${d.id}`;
     const tw = ctx.measureText(label).width;
     const ly = y >= 16 ? y - 16 : y + h + 2;
     ctx.fillStyle = "rgba(0,0,0,0.65)";
     ctx.fillRect(x, ly, tw + 6, 15);
-    ctx.fillStyle = color;
+    ctx.fillStyle = "#ffe600";
     ctx.fillText(label, x + 3, ly + 12);
   }
+  renderFrameVerdict();
 }
 
 function renderFrameNav() {
@@ -172,6 +170,21 @@ function renderFrameNav() {
   $("next-frame").disabled = n === 0 || state.currentFrame >= n - 1;
 }
 
+function renderFrameVerdict() {
+  const el = $("frame-verdict");
+  const v = verdictOf(state.currentFrame);
+  if (!v) {
+    el.className = "muted";
+    el.textContent = "当前帧尚无建议。";
+    return;
+  }
+  const meta = DECISION_META[v.decision];
+  el.className = `frame-verdict ${meta.cls}`;
+  const dup = v.duplicate_of !== null && v.duplicate_of !== undefined
+    ? `（与最早帧 帧 ${v.duplicate_of} 重复）` : "";
+  el.innerHTML = `<span class="badge ${meta.cls}">${meta.label}</span> ${dup} ${v.reason}`;
+}
+
 function switchFrame(delta) {
   const next = state.currentFrame + delta;
   if (next < 0 || next >= state.nFrames) return;
@@ -180,267 +193,140 @@ function switchFrame(delta) {
   draw();
 }
 
-/* ------------------------------------------------------------ 选择与标记 */
+/* ------------------------------------------------------------ 分析任务 */
 
-function renderSelection() {
-  const info = $("selection-info");
-  if (state.selection.length === 0) {
-    info.textContent = "未选择框。点击画面中的检测框进行选择（可跨帧选两个）。";
-  } else {
-    const parts = state.selection.map((id) => {
-      const d = detById(id);
-      return d ? `帧 ${d.frame} 的 #${id}` : `#${id}`;
-    });
-    let text = `已选：${parts.join(" 与 ")}`;
-    if (state.selection.length === 2) {
-      const j = findJudgment(state.selection[0], state.selection[1]);
-      if (j) text += `（当前判断：${j.type === "same" ? "同只" : "异只"}）`;
-    }
-    info.textContent = text;
-  }
-  const two = state.selection.length === 2;
-  $("mark-same").disabled = !two;
-  $("mark-diff").disabled = !two;
-  $("mark-clear").disabled = !two || !findJudgment(state.selection[0], state.selection[1]);
-}
-
-function findJudgment(a, b) {
-  const key = pairKey(a, b);
-  return state.judgments.find((j) => pairKey(j.a, j.b) === key) || null;
-}
-
-function onCanvasClick(ev) {
+async function analyze() {
   if (!state.sessionId) return;
-  const rect = canvas.getBoundingClientRect();
-  const sx = canvas.width / rect.width;
-  const sy = canvas.height / rect.height;
-  const px = (ev.clientX - rect.left) * sx;
-  const py = (ev.clientY - rect.top) * sy;
-  const dets = detsInFrame(state.currentFrame);
-  for (let i = dets.length - 1; i >= 0; i--) {
-    const [x, y, w, h] = dets[i].rect;
-    if (px >= x && px <= x + w && py >= y && py <= y + h) {
-      toggleSelect(dets[i].id);
-      return;
-    }
-  }
-}
-
-function toggleSelect(id) {
-  const i = state.selection.indexOf(id);
-  if (i >= 0) {
-    state.selection.splice(i, 1);
-  } else {
-    if (state.selection.length >= 2) state.selection.shift();
-    state.selection.push(id);
-  }
-  renderSelection();
-  draw();
-}
-
-async function setJudgment(type) {
-  if (state.selection.length !== 2) return;
-  const [a, b] = state.selection;
-  const key = pairKey(a, b);
-  const rest = state.judgments.filter((j) => pairKey(j.a, j.b) !== key);
-  const next = type ? [...rest, { a, b, type }] : rest;
-  invalidateResult(); // 修改即撤下旧结果
-  try {
-    const resp = await api(`/api/sessions/${state.sessionId}/judgments`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ judgments: next }),
-    });
-    state.version = resp.version;
-    state.judgments = next;
-    renderJudgments();
-    renderSelection();
-    draw();
-  } catch (err) {
-    alert(`保存判断失败：${err.message}`);
-  }
-}
-
-async function removeJudgment(a, b) {
-  const key = pairKey(a, b);
-  const next = state.judgments.filter((j) => pairKey(j.a, j.b) !== key);
-  invalidateResult();
-  try {
-    const resp = await api(`/api/sessions/${state.sessionId}/judgments`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ judgments: next }),
-    });
-    state.version = resp.version;
-    state.judgments = next;
-    renderJudgments();
-    renderSelection();
-    draw();
-  } catch (err) {
-    alert(`删除判断失败：${err.message}`);
-  }
-}
-
-function renderJudgments() {
-  const ul = $("judgment-list");
-  ul.innerHTML = "";
-  $("judgment-count").textContent = `（${state.judgments.length} 条）`;
-  for (const j of state.judgments) {
-    const da = detById(j.a);
-    const db = detById(j.b);
-    const li = document.createElement("li");
-    const tag = document.createElement("span");
-    tag.className = `tag ${j.type === "same" ? "same" : "diff"}`;
-    tag.textContent = j.type === "same" ? "同只" : "异只";
-    const text = document.createElement("span");
-    text.textContent = `帧${da ? da.frame : "?"} #${j.a} ↔ 帧${db ? db.frame : "?"} #${j.b}`;
-    const del = document.createElement("button");
-    del.textContent = "删除";
-    del.onclick = () => removeJudgment(j.a, j.b);
-    li.append(tag, text, del);
-    ul.appendChild(li);
-  }
-}
-
-/* ------------------------------------------------------------ 参数 */
-
-async function applyParams() {
-  if (!state.sessionId) return;
-  const wDist = parseFloat($("p-wdist").value);
-  const wApp = parseFloat($("p-wapp").value);
-  const penalty = parseFloat($("p-penalty").value);
-  if (![wDist, wApp, penalty].every((v) => Number.isFinite(v) && v >= 0)) {
-    alert("参数必须是有限非负数。");
-    return;
-  }
-  invalidateResult(); // 修改即撤下旧结果
-  try {
-    const resp = await api(`/api/sessions/${state.sessionId}/params`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ w_dist: wDist, w_app: wApp, penalty }),
-    });
-    state.version = resp.version;
-    state.params = { w_dist: wDist, w_app: wApp, penalty };
-  } catch (err) {
-    alert(`保存参数失败：${err.message}`);
-  }
-}
-
-/* ------------------------------------------------------------ 求解 */
-
-function invalidateResult() {
-  if (state.result !== null) {
-    state.result = null;
-    const banner = $("result-banner");
-    banner.className = "banner stale";
-    banner.textContent = "输入已修改，旧结果已撤下。请重新计算。";
-    $("result-summary").innerHTML = "";
-    $("trajectory-list").innerHTML = "";
-    draw();
-  }
-}
-
-async function solve() {
-  if (!state.sessionId) return;
-  const status = $("solve-status");
-  status.classList.add("muted");
+  const status = $("analyze-status");
+  status.className = "muted small";
   status.style.color = "";
+  resetSuggestion("分析进行中，旧建议已撤下。");
   try {
-    const resp = await api(`/api/sessions/${state.sessionId}/solve`, { method: "POST" });
+    const resp = await api(`/api/sessions/${state.sessionId}/analyze`, { method: "POST" });
     state.jobId = resp.job_id;
-    status.textContent = `计算中（输入版本 v${resp.version}）… 可继续修改判断与参数。`;
+    status.textContent = `分析中（输入版本 v${resp.version}）…`;
     if (state.pollTimer) clearTimeout(state.pollTimer);
-    pollJob(resp.job_id);
+    pollJob(resp.job_id, resp.session_id, resp.version);
   } catch (err) {
-    showError("solve-status", err);
+    showError("analyze-status", err);
   }
 }
 
-async function pollJob(jobId) {
+async function pollJob(jobId, sessionId, jobVersion) {
   try {
     const job = await api(`/api/jobs/${jobId}`);
-    if (jobId !== state.jobId) return; // 已被更新的任务取代
+    // 会话已切换：旧任务结果一律丢弃
+    if (jobId !== state.jobId || sessionId !== state.sessionId) return;
     if (job.status === "running") {
-      state.pollTimer = setTimeout(() => pollJob(jobId), 400);
+      state.pollTimer = setTimeout(() => pollJob(jobId, sessionId, jobVersion), 400);
       return;
     }
-    const status = $("solve-status");
+    const status = $("analyze-status");
     if (job.status === "error") {
-      status.textContent = job.error || "求解失败。";
       status.style.color = "#ff9d97";
+      status.textContent = job.error || "分析失败。";
       return;
     }
-    if (job.version !== state.version) {
-      // 迟到结果：输入在计算期间已变化，丢弃不展示
-      status.textContent =
-        `任务完成，但其基于旧输入（v${job.version}，当前 v${state.version}），结果已作废。请重新计算。`;
+    // 迟到结果双重校验：任务必须属于当前会话且版本一致
+    if (job.session_id !== state.sessionId || job.version !== state.version) {
       status.style.color = "#ffd887";
+      status.textContent =
+        `任务完成但基于旧输入（v${job.version}，当前 v${state.version}），结果已作废，未覆盖当前会话。`;
       const banner = $("result-banner");
       banner.className = "banner stale";
-      banner.textContent = "存在基于旧输入的迟到结果，已自动丢弃，未覆盖当前输入。";
+      banner.textContent = "迟到的旧结果已自动丢弃。";
       return;
     }
-    status.textContent = `计算完成（输入版本 v${job.version}）。`;
-    status.style.color = "";
-    state.result = job.result;
-    renderResult();
+    const result = job.result;
+    if (result && result.status === "failed") {
+      status.style.color = "#ff9d97";
+      status.textContent = result.message;
+      return;
+    }
+    status.className = "muted small";
+    status.textContent = `分析完成（输入版本 v${job.version}）。建议仅作核查参考，原图与检测框未被修改。`;
+    state.report = result;
+    renderReport();
     draw();
   } catch (err) {
-    showError("solve-status", err);
+    showError("analyze-status", err);
   }
 }
 
-function renderResult() {
+/* ------------------------------------------------------------ 结果渲染 */
+
+function fmt(v, digits = 3) {
+  return v === null || v === undefined ? "—" : Number(v).toFixed(digits);
+}
+
+function regionBlock(title, r) {
+  if (!r) return "";
+  const head = r.sufficient
+    ? `${title}：证据充分`
+    : `${title}：<span class="weak">证据不足</span>`;
+  const detail = r.disjoint
+    ? "检测框无交集（位置变化强证据）"
+    : `RMSE ${fmt(r.rmse)} · 相关 ${fmt(r.corr, 4)} · 姿态 ${fmt(r.hog_dist, 4)} · 能量 ${fmt(r.energy)} · ${r.pixels}px`;
+  const reason = r.reason ? `<div class="region-reason">${r.reason}</div>` : "";
+  return `<div class="region ${r.sufficient ? "" : "insufficient"}">
+    <div>${head}</div><div class="metric">${detail}</div>${reason}
+  </div>`;
+}
+
+function renderReport() {
+  const r = state.report;
   const banner = $("result-banner");
-  const summary = $("result-summary");
-  const list = $("trajectory-list");
-  const r = state.result;
   if (!r) return;
-  if (!r.feasible) {
-    banner.className = "banner err";
-    banner.textContent = `无解：${r.message || "约束冲突。"}`;
-    summary.innerHTML = "<b>不提供动物计数。</b>";
-    list.innerHTML = "";
-    return;
-  }
+
+  const counts = { keep: 0, omit: 0, review: 0 };
+  for (const v of r.verdicts) counts[v.decision] = (counts[v.decision] || 0) + 1;
   banner.className = "banner ok";
-  banner.textContent = r.message || "求解成功。";
-  summary.innerHTML =
-    `<div><span class="count">${r.animal_count}</span>只动物（按轨迹条数计）</div>` +
-    `<div>轨迹条数：${r.n_trajectories}</div>` +
-    `<div>总代价：${r.total_cost.toFixed(3)}` +
-    `（关联代价 ${r.assoc_cost.toFixed(3)} + 轨迹罚分 ${r.penalty_cost.toFixed(3)}）</div>`;
-  list.innerHTML = "";
-  r.trajectories.forEach((t, i) => {
-    const div = document.createElement("div");
-    div.className = "traj";
-    const sw = document.createElement("span");
-    sw.className = "swatch";
-    sw.style.background = PALETTE[i % PALETTE.length];
-    const boxes = document.createElement("span");
-    boxes.className = "boxes";
-    boxes.textContent = `轨迹 T${i + 1}：` + t.boxes.map((b) => `帧${b.frame} #${b.id}`).join(" → ");
-    const len = document.createElement("span");
-    len.className = "len";
-    len.textContent = `（${t.length} 框）`;
-    div.append(sw, boxes, len);
-    list.appendChild(div);
+  banner.textContent =
+    `分析完成：${counts.keep} 帧保留、${counts.omit} 帧建议省略、${counts.review} 帧待核。`;
+
+  $("verdict-summary").innerHTML =
+    `<div class="summary-line">
+       <span class="chip keep">保留 ${counts.keep}</span>
+       <span class="chip omit">省略 ${counts.omit}</span>
+       <span class="chip review">待核 ${counts.review}</span>
+     </div>
+     <div class="muted small">自动省略仅在背景与动物区域都有充分可辨证据、且重复组内每两帧均相符时发生；其余情形一律保守处理。</div>`;
+
+  const vlist = $("verdict-list");
+  vlist.innerHTML = "";
+  r.verdicts.forEach((v) => {
+    const meta = DECISION_META[v.decision];
+    const row = document.createElement("div");
+    row.className = `verdict-row ${meta.cls}`;
+    row.innerHTML =
+      `<span class="badge ${meta.cls}">${meta.label}</span>` +
+      `<span class="frame-name">帧 ${v.frame}</span>` +
+      (v.duplicate_of !== null && v.duplicate_of !== undefined
+        ? `<span class="muted small">重复于最早帧 帧 ${v.duplicate_of}</span>` : "") +
+      `<span class="reason-text">${v.reason}</span>`;
+    row.addEventListener("click", () => {
+      state.currentFrame = v.frame;
+      renderFrameNav();
+      draw();
+    });
+    vlist.appendChild(row);
   });
-}
 
-/* ------------------------------------------------------------ 汇总渲染 */
-
-function renderAll() {
-  renderFrameNav();
-  renderSelection();
-  renderJudgments();
-  draw();
-  const banner = $("result-banner");
-  banner.className = "banner muted";
-  banner.textContent = "尚无结果。";
-  $("result-summary").innerHTML = "";
-  $("trajectory-list").innerHTML = "";
+  const plist = $("pair-list");
+  plist.innerHTML = "";
+  r.pairs.forEach((p) => {
+    const meta = LABEL_META[p.label];
+    const div = document.createElement("div");
+    div.className = "pair-card";
+    div.innerHTML =
+      `<div class="pair-head">
+         <span class="pair-name">帧 ${p.a} ↔ 帧 ${p.b}</span>
+         <span class="pair-label ${meta.cls}">${meta.text}</span>
+       </div>
+       <div class="pair-regions">${regionBlock("背景", p.background)}${regionBlock("动物", p.animal)}</div>
+       <div class="pair-reason">${p.reason}</div>`;
+    plist.appendChild(div);
+  });
 }
 
 /* ------------------------------------------------------------ 事件绑定 */
@@ -449,14 +335,7 @@ $("upload-btn").addEventListener("click", uploadSession);
 $("example-btn").addEventListener("click", loadExample);
 $("prev-frame").addEventListener("click", () => switchFrame(-1));
 $("next-frame").addEventListener("click", () => switchFrame(1));
-$("mark-same").addEventListener("click", () => setJudgment("same"));
-$("mark-diff").addEventListener("click", () => setJudgment("different"));
-$("mark-clear").addEventListener("click", () => setJudgment(null));
-$("solve-btn").addEventListener("click", solve);
-canvas.addEventListener("click", onCanvasClick);
-for (const id of ["p-wdist", "p-wapp", "p-penalty"]) {
-  $(id).addEventListener("change", applyParams);
-}
+$("analyze-btn").addEventListener("click", analyze);
 document.addEventListener("keydown", (ev) => {
   if (ev.target.tagName === "INPUT") return;
   if (ev.key === "ArrowLeft") switchFrame(-1);
